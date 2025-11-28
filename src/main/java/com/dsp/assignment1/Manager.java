@@ -24,6 +24,7 @@ import java.util.stream.Collectors;
 
 public class Manager {
     private static final Region REGION = Utils.REGION;
+    public static final String WORKER_AMI_ID = "ami-0ed259eaabf1ff80d";
     private static final S3Client s3 = S3Client.builder().region(REGION).build();
     private static final SqsClient sqs = SqsClient.builder().region(REGION).build();
     private static final Ec2Client ec2 = Ec2Client.builder().region(REGION).build();
@@ -205,8 +206,17 @@ public class Manager {
     private static void startWorkers(int count) {
         // User Data for Worker
         String userDataScript = "#!/bin/bash\n" +
-                "aws s3 cp s3://" + Utils.S3_BUCKET_NAME + "/assignment1.jar /home/ec2-user/assignment1.jar\n" +
-                "java -cp /home/ec2-user/assignment1.jar com.dsp.assignment1.Worker\n";
+        // 1. Create directory for models
+        "mkdir -p /home/ec2-user/stanford\n" +
+        
+        // 2. Download the Model File (One time download)
+        "aws s3 cp s3://" + Utils.S3_BUCKET_NAME + "/stanford/englishPCFG.ser.gz /home/ec2-user/stanford/englishPCFG.ser.gz\n" +
+        
+        // 3. Download the Tiny Worker JAR
+        // "aws s3 cp s3://" + Utils.S3_BUCKET_NAME + "/worker.jar /home/ec2-user/worker.jar\n" + 
+        
+        // 4. Run Java (No change to memory flag needed, but it loads faster now)
+        "java -Xmx6000m -jar /home/ec2-user/worker.jar\n";
         
         String userDataEncoded = Base64.getEncoder().encodeToString(userDataScript.getBytes());
 
@@ -216,13 +226,14 @@ public class Manager {
                 .build();
 
         RunInstancesRequest runRequest = RunInstancesRequest.builder()
-                .imageId(Utils.AMI_ID)
-                .instanceType(InstanceType.T2_MICRO)
+                .imageId(WORKER_AMI_ID)
+                .instanceType(InstanceType.T3_LARGE)
+                .keyName("vockey")
                 .maxCount(count)
                 .minCount(count)
                 .userData(userDataEncoded)
                 .tagSpecifications(tagSpec)
-                .iamInstanceProfile(IamInstanceProfileSpecification.builder().arn("arn:aws:iam::288140534550:instance-profile/LabInstanceProfile").build())
+                .iamInstanceProfile(IamInstanceProfileSpecification.builder().name("LabInstanceProfile").build())
                 .build();
 
         try {
@@ -385,23 +396,36 @@ public class Manager {
     
     private static String getMyInstanceId() {
         try {
-            // Retrieve instance ID from EC2 Instance Metadata Service
+            // 1. Get Token (IMDSv2)
+            URL tokenUrl = new URL("http://169.254.169.254/latest/api/token");
+            HttpURLConnection tokenConn = (HttpURLConnection) tokenUrl.openConnection();
+            tokenConn.setRequestMethod("PUT");
+            tokenConn.setRequestProperty("X-aws-ec2-metadata-token-ttl-seconds", "21600");
+            tokenConn.setConnectTimeout(1000);
+            
+            String token;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(tokenConn.getInputStream()))) {
+                token = reader.readLine();
+            }
+    
+            // 2. Get Instance ID using Token
             URL url = new URL("http://169.254.169.254/latest/meta-data/instance-id");
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setConnectTimeout(1000);
             connection.setRequestMethod("GET");
-            
+            connection.setRequestProperty("X-aws-ec2-metadata-token", token); // Pass the token
+            connection.setConnectTimeout(1000);
+    
             if (connection.getResponseCode() == 200) {
                 try (BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()))) {
                     return reader.readLine();
                 }
             }
         } catch (Exception e) {
-            // Not running on EC2 or metadata service unreachable
+            System.err.println("Could not retrieve Instance ID: " + e.getMessage());
         }
         return null;
     }
-
+    
     // Helper Class
     private static class JobInfo {
         String id;

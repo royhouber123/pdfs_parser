@@ -1,14 +1,15 @@
 package com.dsp.assignment1;
 
-import edu.stanford.nlp.ling.CoreAnnotations;
-import edu.stanford.nlp.ling.CoreLabel;
-import edu.stanford.nlp.pipeline.Annotation;
-import edu.stanford.nlp.pipeline.StanfordCoreNLP;
-import edu.stanford.nlp.semgraph.SemanticGraph;
-import edu.stanford.nlp.semgraph.SemanticGraphCoreAnnotations;
+import edu.stanford.nlp.ling.HasWord;
+import edu.stanford.nlp.ling.TaggedWord;
+import edu.stanford.nlp.parser.lexparser.LexicalizedParser;
+import edu.stanford.nlp.process.DocumentPreprocessor;
+import edu.stanford.nlp.trees.GrammaticalStructure;
+import edu.stanford.nlp.trees.GrammaticalStructureFactory;
+import edu.stanford.nlp.trees.PennTreebankLanguagePack;
 import edu.stanford.nlp.trees.Tree;
-import edu.stanford.nlp.trees.TreeCoreAnnotations;
-import edu.stanford.nlp.util.CoreMap;
+import edu.stanford.nlp.trees.TreebankLanguagePack;
+import edu.stanford.nlp.trees.TypedDependency;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
@@ -18,27 +19,36 @@ import software.amazon.awssdk.services.sqs.model.*;
 import java.io.*;
 import java.net.URL;
 import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
-import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class Worker {
     private static final Region REGION = Utils.REGION;
     private static final S3Client s3 = S3Client.builder().region(REGION).build();
     private static final SqsClient sqs = SqsClient.builder().region(REGION).build();
 
-    private static StanfordCoreNLP pipeline;
+    private static LexicalizedParser parser;
 
     public static void main(String[] args) {
         System.out.println("Worker started.");
 
-        // Initialize Stanford CoreNLP
-        Properties props = new Properties();
-        props.put("annotators", "tokenize, ssplit, pos, parse");
-        // "parse" usually includes constituency and dependency
-        pipeline = new StanfordCoreNLP(props);
+        // Initialize Stanford Parser (Legacy 3.6.0)
+        // Load default english model
+        try {
+            parser = LexicalizedParser.loadModel("/home/ec2-user/stanford/englishPCFG.ser.gz");
+        } catch (Exception e) {
+            System.err.println("Failed to load parser model: " + e.getMessage());
+            // e.printStackTrace();
+            // If model is missing, we can't proceed. 
+            // Maybe try to load from file system if it was downloaded?
+            // For now assume it's in the classpath (in the shaded jar models).
+        }
 
         String taskQueueUrl = getQueueUrl(Utils.WORKER_TASK_QUEUE_NAME);
         String resultQueueUrl = getQueueUrl(Utils.WORKER_RESULT_QUEUE_NAME);
@@ -50,7 +60,7 @@ public class Worker {
                     .queueUrl(taskQueueUrl)
                     .maxNumberOfMessages(1)
                     .waitTimeSeconds(20)
-                    .visibilityTimeout(60) // Extend if processing takes longer
+                    .visibilityTimeout(1800)
                     .build());
 
             if (!response.messages().isEmpty()) {
@@ -58,7 +68,6 @@ public class Worker {
                 try {
                     processMessage(message, resultQueueUrl);
                     
-                    // Delete message ONLY after successful processing and reporting
                     sqs.deleteMessage(DeleteMessageRequest.builder()
                             .queueUrl(taskQueueUrl)
                             .receiptHandle(message.receiptHandle())
@@ -66,8 +75,6 @@ public class Worker {
                             
                 } catch (Exception e) {
                     e.printStackTrace();
-                    // If an exception occurred (e.g. failed to send result), do NOT delete the message.
-                    // Let visibility timeout expire so it can be retried.
                 }
             }
         }
@@ -80,7 +87,6 @@ public class Worker {
     private static void processMessage(Message message, String resultQueueUrl) {
         String body = message.body();
         System.out.println("Processing: " + body);
-        // Format: "ANALYSIS_TYPE \t URL \t JOB_ID"
         String[] parts = body.split("\t");
         String analysisType = parts[0];
         String url = parts[1];
@@ -89,14 +95,9 @@ public class Worker {
         String resultUrlOrError;
         
         try {
-            // Download file
             File inputFile = downloadFile(url);
-            String content = new String(Files.readAllBytes(inputFile.toPath()));
+            String outputContent = analyze(inputFile, analysisType);
             
-            // Analyze
-            String outputContent = analyze(content, analysisType);
-            
-            // Upload Result
             String outputKey = "output/" + jobId + "/" + UUID.randomUUID() + ".txt";
             uploadToS3(outputKey, outputContent);
             
@@ -107,8 +108,6 @@ public class Worker {
             resultUrlOrError = "Exception: " + e.getMessage();
         }
         
-        // Send Result
-        // "JOB_ID \t INPUT_URL \t OUTPUT_S3_URL \t ANALYSIS_TYPE \t [ERROR]"
         String resultBody = String.join("\t", jobId, url, resultUrlOrError, analysisType);
         
         sqs.sendMessage(SendMessageRequest.builder()
@@ -126,39 +125,90 @@ public class Worker {
         return temp;
     }
 
-    private static String analyze(String text, String type) {
-        // "In case the Stanford parser find it hard to analyze the whole text file, feel free to parse the file line-by-line"
-        // Let's assume file is not huge, but for robustness we could split.
-        // Given the assignment, let's do per-sentence or per-line if needed.
-        // Stanford CoreNLP handles multiple sentences.
+    private static String analyze(File file, String type) throws IOException {
+        // Create temporary file for output (streaming to disk instead of RAM)
+        File outputFile = File.createTempFile("worker_analysis", ".txt");
         
-        Annotation document = new Annotation(text);
-        pipeline.annotate(document);
+        // DocumentPreprocessor splits text into sentences efficiently
+        DocumentPreprocessor tokenizer = new DocumentPreprocessor(file.getAbsolutePath());
         
-        List<CoreMap> sentences = document.get(CoreAnnotations.SentencesAnnotation.class);
+        TreebankLanguagePack tlp = new PennTreebankLanguagePack();
+        GrammaticalStructureFactory gsf = tlp.grammaticalStructureFactory();
+
+        // 1. Define a thread pool (utilize all available CPUs)
+        int cores = Runtime.getRuntime().availableProcessors();
+        ExecutorService executor = Executors.newFixedThreadPool(cores);
+        List<Future<String>> futures = new ArrayList<>();
+
+        try {
+            // 2. Submit parsing tasks to thread pool
+            for (List<HasWord> sentence : tokenizer) {
+                // Capture sentence in final variable for lambda
+                final List<HasWord> sentenceCopy = new ArrayList<>(sentence);
+                
+                // Submit the parsing task to the pool
+                futures.add(executor.submit(() -> {
+                    // Validation check inside the thread
+                    if (sentenceCopy.size() > 80) {
+                        return "";
+                    }
+                    
+                    // The heavy lifting - parsing
+                    Tree parse = parser.apply(sentenceCopy);
+                    return processParseResult(parse, type, gsf);
+                }));
+            }
+
+            // 3. Collect results in order (preserves text order) and write to file
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(outputFile))) {
+                for (Future<String> future : futures) {
+                    try {
+                        String resultString = future.get(); // Waits for thread to finish
+                        if (!resultString.isEmpty()) {
+                            writer.write(resultString);
+                        }
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        } finally {
+            executor.shutdown();
+        }
+        
+        // Read the file content and return as string
+        byte[] content = Files.readAllBytes(outputFile.toPath());
+        
+        // Clean up temporary file
+        outputFile.delete();
+        
+        return new String(content);
+    }
+    
+    /**
+     * Helper method to process parse result based on analysis type
+     */
+    private static String processParseResult(Tree parse, String type, GrammaticalStructureFactory gsf) {
         StringBuilder result = new StringBuilder();
         
-        for (CoreMap sentence : sentences) {
-            switch (type) {
-                case "POS":
-                    for (CoreLabel token : sentence.get(CoreAnnotations.TokensAnnotation.class)) {
-                        String word = token.get(CoreAnnotations.TextAnnotation.class);
-                        String pos = token.get(CoreAnnotations.PartOfSpeechAnnotation.class);
-                        result.append(word).append("/").append(pos).append(" ");
-                    }
-                    result.append("\n");
-                    break;
-                    
-                case "CONSTITUENCY":
-                    Tree tree = sentence.get(TreeCoreAnnotations.TreeAnnotation.class);
-                    result.append(tree.toString()).append("\n");
-                    break;
-                    
-                case "DEPENDENCY":
-                    SemanticGraph dependencies = sentence.get(SemanticGraphCoreAnnotations.CollapsedCCProcessedDependenciesAnnotation.class);
-                    result.append(dependencies.toString(SemanticGraph.OutputFormat.LIST)).append("\n");
-                    break;
-            }
+        switch (type) {
+            case "POS":
+                List<TaggedWord> taggedWords = parse.taggedYield();
+                for (TaggedWord tw : taggedWords) {
+                    result.append(tw.word()).append("/").append(tw.tag()).append(" ");
+                }
+                result.append("\n");
+                break;
+                
+            case "CONSTITUENCY":
+                result.append(parse.toString()).append("\n");
+                break;
+                
+            case "DEPENDENCY":
+                GrammaticalStructure gs = gsf.newGrammaticalStructure(parse);
+                Collection<TypedDependency> tdl = gs.typedDependencies();
+                result.append(tdl.toString()).append("\n");
+                break;
         }
         
         return result.toString();
@@ -174,4 +224,3 @@ public class Worker {
                 .build(), temp.toPath());
     }
 }
-

@@ -19,6 +19,7 @@ import java.util.UUID;
 
 public class LocalApplication {
     private static final Region REGION = Utils.REGION;
+    public static final String MANAGER_AMI_ID = "ami-023186f8ad1eccd14";
     private static final S3Client s3 = S3Client.builder().region(REGION).build();
     private static final SqsClient sqs = SqsClient.builder().region(REGION).build();
     private static final Ec2Client ec2 = Ec2Client.builder().region(REGION).build();
@@ -86,9 +87,25 @@ public class LocalApplication {
     private static void ensureBucketExists(String bucketName) {
         try {
             s3.headBucket(HeadBucketRequest.builder().bucket(bucketName).build());
+            System.out.println("Bucket " + bucketName + " already exists.");
         } catch (NoSuchBucketException e) {
             System.out.println("Bucket " + bucketName + " does not exist. Creating...");
             s3.createBucket(CreateBucketRequest.builder().bucket(bucketName).build());
+            System.out.println("Bucket " + bucketName + " created successfully.");
+        } catch (Exception e) {
+            // If headBucket fails for any other reason, try to create the bucket
+            System.out.println("Error checking bucket existence: " + e.getMessage() + ". Attempting to create...");
+            try {
+                s3.createBucket(CreateBucketRequest.builder().bucket(bucketName).build());
+                System.out.println("Bucket " + bucketName + " created successfully.");
+            } catch (Exception createEx) {
+                // If bucket already exists, that's fine
+                if (createEx.getMessage() != null && createEx.getMessage().contains("BucketAlreadyExists")) {
+                    System.out.println("Bucket " + bucketName + " already exists (created by another process).");
+                } else {
+                    throw createEx;
+                }
+            }
         }
     }
 
@@ -127,10 +144,10 @@ public class LocalApplication {
 
     private static void startManager() {
         // User Data script to start the Manager
-        // Using baked-in JAR at /home/ec2-user/assignment1.jar
+        // Using baked-in JAR at /home/ec2-user/manager.jar
         String userDataScript = "#!/bin/bash\n" +
-                // "aws s3 cp s3://" + Utils.S3_BUCKET_NAME + "/assignment1.jar /home/ec2-user/assignment1.jar\n" + // Skip download
-                "java -cp /home/ec2-user/assignment1.jar com.dsp.assignment1.Manager\n";
+                // "aws s3 cp s3://" + Utils.S3_BUCKET_NAME + "/manager.jar /home/ec2-user/manager.jar\n" + // Skip download
+                "java -jar /home/ec2-user/manager.jar\n";
         
         String userDataEncoded = Base64.getEncoder().encodeToString(userDataScript.getBytes());
 
@@ -140,13 +157,14 @@ public class LocalApplication {
                 .build();
 
         RunInstancesRequest runRequest = RunInstancesRequest.builder()
-                .imageId(Utils.AMI_ID)
-                .instanceType(InstanceType.T2_MICRO) 
+                .imageId(MANAGER_AMI_ID)
+                .instanceType(InstanceType.T3_LARGE) 
+                .keyName("vockey")
                 .maxCount(1)
                 .minCount(1)
                 .userData(userDataEncoded)
                 .tagSpecifications(tagSpec)
-                .iamInstanceProfile(IamInstanceProfileSpecification.builder().arn("arn:aws:iam::288140534550:instance-profile/LabInstanceProfile").build()) 
+                .iamInstanceProfile(IamInstanceProfileSpecification.builder().name("LabInstanceProfile").build()) 
                 .build();
 
         ec2.runInstances(runRequest);
